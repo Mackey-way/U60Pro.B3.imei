@@ -1,0 +1,10 @@
+.build/
+*.o
+# on-device runtime artifacts (never commit these)
+szi_imei_backup.hex
+.szi_state
+.szi_plan.cfg
+plan.cfg
+config_*.bin
+nv550_*.bin
+nv550_*.hex

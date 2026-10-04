@@ -1,0 +1,193 @@
+#!/bin/sh
+# set_zte_imei - change the IMEI of a ZTE MU5250 / U60 Pro (firmware HK B03),
+# running ON THE DEVICE. One self-contained file; no host, SSH or network.
+#
+# Copy this single file onto the modem (e.g. to /data/local/tmp) and run it there.
+# The helper binaries are embedded (base64) and unpacked next to it on first run.
+# The EFS /config "plan" is BUILT FROM THIS DEVICE's own /config at runtime - nothing
+# device-specific is baked into this file.
+#
+# Why three runs: B03 applies the NV write-enable only across a REBOOT, and a reboot
+# kills this process - so the job is resumable. It does one phase, reboots, and you
+# run it again after boot. Two reboots total:
+#
+#     sh set_zte_imei <NEW_IMEI>     # phase 1: back up IMEI, enable-flag, reboot
+#     ( modem reboots )
+#     sh set_zte_imei                     # phase 2: write new IMEI, reboot (re-lock)
+#     ( modem reboots )
+#     sh set_zte_imei                     # phase 3: verify -> done
+#
+# Commands:
+#     sh set_zte_imei <15-digit IMEI>   # change IMEI (persistent, verified)
+#     sh set_zte_imei                   # continue an in-progress job after a reboot
+#     sh set_zte_imei read              # print current IMEI (NV550 + ubus)
+#     sh set_zte_imei restore           # write back the IMEI this tool backed up
+#     sh set_zte_imei check             # read-only: /config factory & DIAG reachable?
+#     sh set_zte_imei abort             # drop a half-finished job (no reboot)
+#
+# The first change (or `read`) saves the current IMEI record to szi_imei_backup.hex
+# next to the tool; `restore` writes it back. The device is single-IMEI: only NV550
+# index 0 is written.
+#
+# USE AT YOUR OWN RISK. Changing the IMEI of a device may be illegal in your country;
+# only do this on hardware you own where it is lawful. This writes modem NV/EFS.
+set -u
+SELF=$0
+DIR=$(dirname "$SELF"); [ -d "$DIR" ] || DIR=/data/local/tmp
+STATE="$DIR/.szi_state"
+PLAN="$DIR/.szi_plan.cfg"
+BK="$DIR/szi_imei_backup.hex"
+CFG="$DIR/zte_config_b03"
+RD="$DIR/zte_config_read"
+NV="$DIR/diagnv"
+MK="$DIR/mkplan"
+
+die() { echo "[err] $*" >&2; exit 1; }
+
+extract_blob() {
+  pat="#BLOB:$1"
+  awk -v p="$pat" '$0==p{f=1;next} $0=="#ENDBLOB"{f=0} f{print}' "$SELF" | base64 -d > "$DIR/$1" \
+    || die "cannot unpack $1 (need awk + base64; run by path: sh /data/local/tmp/set_zte_imei ...)"
+}
+unpack() {
+  extract_blob zte_config_b03;  chmod 755 "$CFG"
+  extract_blob zte_config_read; chmod 755 "$RD"
+  extract_blob diagnv;          chmod 755 "$NV"
+  extract_blob mkplan;          chmod 755 "$MK"
+  [ -s "$CFG" ] && [ -s "$RD" ] && [ -s "$NV" ] && [ -s "$MK" ] || die "unpack produced empty files"
+}
+kill_stale() {
+  for p in /proc/[0-9]*; do
+    c=$(cat "$p/comm" 2>/dev/null)
+    case "$c" in diagnv|zte_config*|zte_nv|mkplan) kill -9 "${p#/proc/}" 2>/dev/null;; esac
+  done
+}
+
+# IMEI(15 digits) -> 256-hex NV550 record (validates Luhn). prints ERR* on bad input.
+imei_to_hex() {
+  awk -v imei="$1" 'BEGIN{
+    if (length(imei)!=15){print "ERR_LEN"; exit 1}
+    if (imei ~ /[^0-9]/){print "ERR_DIG"; exit 1}
+    s=0
+    for(i=1;i<=15;i++){d=substr(imei,i,1)+0; if(i%2==0){d*=2; if(d>9)d-=9} s+=d}
+    if(s%10!=0){print "ERR_LUHN"; exit 1}
+    for(i=0;i<15;i++) a[i]=substr(imei,i+1,1)+0
+    h=sprintf("08%02x", a[0]*16+10)
+    for(i=0;i<7;i++){b=a[2+2*i]*16+a[1+2*i]; h=h sprintf("%02x",b)}
+    for(i=0;i<119;i++) h=h "00"
+    print h
+  }'
+}
+hex_to_imei() {
+  awk -v h="$1" 'BEGIN{
+    if (substr(h,1,2)!="08"){print "<not-an-IMEI-record>"; exit}
+    out=substr(h,3,1)
+    for(i=0;i<7;i++){later=substr(h,5+2*i,1); earlier=substr(h,6+2*i,1); out=out earlier later}
+    print out
+  }'
+}
+nv_read0_hex() { "$NV" read 0 2>/dev/null | awk '/^RECORD /{print $2; exit}'; }
+show_imei() {
+  hx=$(nv_read0_hex)
+  [ -n "$hx" ] && echo "[imei] NV550 index0 = $(hex_to_imei "$hx")" || echo "[imei] NV550 read failed"
+  u=$(ubus call zwrt_web device_info '{}' 2>/dev/null | tr ',' '\n' | grep -i '"imei"' | head -n1 | tr -s ' ')
+  [ -n "$u" ] && echo "[imei] ubus:$u"
+}
+backup_once() {
+  [ -s "$BK" ] && return 0
+  hx=$(nv_read0_hex)
+  case "$hx" in
+    08*) printf '%s\n' "$hx" > "$BK"; echo "[backup] current IMEI record saved -> $BK ($(hex_to_imei "$hx"))";;
+    *)   echo "[backup] WARNING: could not read current IMEI to back up";;
+  esac
+}
+build_plan() {
+  kill_stale
+  "$RD" --read-config 2>/dev/null | "$MK" "$PLAN" || die "could not build /config plan (see mkplan message)"
+  [ -s "$PLAN" ] || die "plan not created"
+  sz=$(wc -c < "$PLAN" 2>/dev/null)
+  [ "$sz" = 30146 ] || die "plan wrong size ($sz, expected 30146)"
+}
+do_reboot() { echo "[reboot] $1"; sync; sleep 1; reboot; exit 0; }
+
+cmd_read()  { unpack; kill_stale; show_imei; backup_once; }
+cmd_check() {
+  unpack; build_plan
+  "$CFG" --check-original "$PLAN" 2>&1 | grep -E 'CONFIG_STAT index=0|CONFIG_RESULT outcome' || true
+  "$CFG" --check-original "$PLAN" 2>&1 | grep -q 'outcome=0' \
+    && echo "[check] /config is factory (flag=0), DIAG reachable - OK to proceed" \
+    || echo "[check] NOT clean - inspect before writing"
+}
+cmd_abort() { rm -f "$STATE" "$PLAN"; echo "[abort] cleared pending job (no reboot)"; }
+
+# phase 1: validate target, back up current, build plan, enable-flag, reboot
+start() {
+  [ -f "$STATE" ] && die "a job is already in progress; run 'sh $SELF' to continue, or 'abort'"
+  hex=$1
+  echo "[target] IMEI=$(hex_to_imei "$hex")"
+  unpack; kill_stale
+  echo "[phase 1/3] current:"; show_imei
+  backup_once
+  echo "[phase 1/3] build plan from this device's /config"
+  build_plan
+  echo "[phase 1/3] enable-flag (/config flag102 -> 1)"
+  out=$("$CFG" --enable-flag "$PLAN" 2>&1)
+  echo "$out" | grep -E 'CONFIG_TARGET_VERIFIED|CONFIG_RESULT outcome' || true
+  echo "$out" | grep -q 'outcome=0' || die "enable-flag failed (see output above)"
+  printf 'write %s\n' "$hex" > "$STATE"
+  echo "[phase 1/3] OK. Rebooting; AFTER boot run:  sh $SELF"
+  do_reboot "applying write-enable"
+}
+
+resume() {
+  [ -f "$STATE" ] || die "nothing in progress. Usage: sh $SELF <15-digit IMEI> | read | restore | check"
+  phase=$(awk '{print $1; exit}' "$STATE")
+  hex=$(awk '{print $2; exit}' "$STATE")
+  [ -n "$hex" ] || { rm -f "$STATE"; die "corrupt state cleared; start over"; }
+  unpack; kill_stale
+  case "$phase" in
+    write)
+      echo "[phase 2/3] write NV550 index0 (expect status=0000, VERIFY OK)"
+      out=$("$NV" write 0 "$hex" --arm 2>&1)
+      echo "$out" | grep -iE 'WRITE resp|status=|VERIFY' || true
+      echo "$out" | grep -q 'status=0000' || die "write not status 0 - flag not honored. Was there exactly ONE reboot after phase 1? If unsure: 'abort' and retry."
+      echo "$out" | grep -q 'VERIFY OK'  || die "verify failed; state kept"
+      printf 'verify %s\n' "$hex" > "$STATE"
+      echo "[phase 2/3] OK. Rebooting to re-lock; AFTER boot run:  sh $SELF"
+      do_reboot "locking NV back to read-only"
+      ;;
+    verify)
+      echo "[phase 3/3] verify persistence after lock reboot"
+      got=$(nv_read0_hex)
+      show_imei
+      if [ "$got" = "$hex" ]; then
+        rm -f "$STATE" "$PLAN"
+        echo "[done] IMEI $(hex_to_imei "$hex") is persistent (survived lock reboot)."
+      else
+        die "mismatch: NV reads $(hex_to_imei "$got"), expected $(hex_to_imei "$hex") (state kept)"
+      fi
+      ;;
+    *) rm -f "$STATE"; die "unknown phase '$phase' cleared; start over";;
+  esac
+}
+
+case "${1:-}" in
+  "")        resume ;;
+  read)      cmd_read ;;
+  check)     cmd_check ;;
+  abort)     cmd_abort ;;
+  restore)
+    unpack
+    [ -s "$BK" ] || die "no backup at $BK (run a change or 'read' first to capture the original)"
+    hx=$(cat "$BK")
+    case "$hx" in 08*) : ;; *) die "backup file malformed";; esac
+    start "$hx" ;;
+  *[!0-9]*)  die "unknown command '$1'. Usage: sh $SELF <15-digit IMEI> | read | restore | check | abort" ;;
+  *)
+    hx=$(imei_to_hex "$1") || die "bad IMEI ($hx)"
+    start "$hx" ;;
+esac
+exit 0
+
+# ============================ embedded artifacts =============================
+# Base64 blobs below, unpacked by awk+base64 on the device. Do not edit.
