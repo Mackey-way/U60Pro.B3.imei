@@ -34,6 +34,7 @@
 set -u
 SELF=$0
 DIR=$(dirname "$SELF"); [ -d "$DIR" ] || DIR=/data/local/tmp
+case "$DIR" in /*) ;; *) DIR=$(cd "$DIR" && pwd);; esac
 STATE="$DIR/.szi_state"
 PLAN="$DIR/.szi_plan.cfg"
 BK="$DIR/szi_imei_backup.hex"
