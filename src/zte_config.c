@@ -241,7 +241,8 @@ static int read_file(int ix,uint8_t out[CONFIG_SIZE]) {
      * the 0x8c40..0x8c7f family for the live /config read; content is still fully
      * validated by schema+MSB-CRC. Staged/post-commit /config stays 0x8d00. */
     int b03_live=(st.mode&0xff00u)==0x8c00u; /* 0x8c00..0x8cff: B03 live /config (mode drifts across boots) */
-    int mode_ok=st.mode==0x8d00||(ix==0&&(st.mode==0x8d20||b03_live));
+    int b31_live=(st.mode&0xff00u)==0x8d00u; /* 0x8d00..0x8dff: B31 live /config (0x8d00, 0x8d10, 0x8d20 observed) */
+    int mode_ok=(ix==0&&(b03_live||b31_live))||st.mode==0x8d00;
     if(!mode_ok||st.size!=CONFIG_SIZE||st.nlink!=1||!open_path(ix,0)) return 0;
     int okay=1;
     for(uint32_t off=0;off<CONFIG_SIZE;) {
